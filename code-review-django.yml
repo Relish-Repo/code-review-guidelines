@@ -1,0 +1,165 @@
+name: Automated Code Review
+
+on:
+  pull_request:
+    branches:
+      - main
+      - dev
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+# ─── ONLY THIS CHANGES between Next.js and Django repos ───
+env:
+  TECH_FILE: django.md
+  GUIDELINES_REPO: Relish-Repo/code-review-guidelines
+  GUIDELINES_BRANCH: main
+# ──────────────────────────────────────────────────────────
+
+jobs:
+  code-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        id: diff
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
+
+          SIZE=$(wc -c < /tmp/pr.diff)
+          echo "size=$SIZE" >> $GITHUB_OUTPUT
+
+          # Truncate if too large (>40,000 chars)
+          if [ "$SIZE" -gt 40000 ]; then
+            head -c 40000 /tmp/pr.diff > /tmp/pr_trimmed.diff
+            mv /tmp/pr_trimmed.diff /tmp/pr.diff
+            echo "truncated=true" >> $GITHUB_OUTPUT
+            echo "⚠️ Diff was large and has been truncated."
+          else
+            echo "truncated=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fetch guidelines from private repo
+        env:
+          GUIDELINES_TOKEN: ${{ secrets.GUIDELINES_TOKEN }}
+        run: |
+          BASE="https://raw.githubusercontent.com/${{ env.GUIDELINES_REPO }}/${{ env.GUIDELINES_BRANCH }}"
+          AUTH="Authorization: token $GUIDELINES_TOKEN"
+
+          curl -sSf -H "$AUTH" "$BASE/core.md" -o /tmp/core.md
+          curl -sSf -H "$AUTH" "$BASE/${{ env.TECH_FILE }}" -o /tmp/tech.md
+
+          echo "✅ Guidelines fetched successfully."
+
+      - name: Install Anthropic SDK
+        run: pip install anthropic --quiet
+
+      - name: Run Claude code review
+        id: review
+        env:
+          CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+        run: |
+          python3 - <<'EOF'
+          import anthropic, os, sys
+
+          core       = open("/tmp/core.md").read()
+          tech       = open("/tmp/tech.md").read()
+          diff       = open("/tmp/pr.diff").read()
+          truncated  = os.environ.get("TRUNCATED", "false") == "true"
+
+          if not diff.strip():
+              print("NO_DIFF")
+              sys.exit(0)
+
+          prompt = f"""You are an expert code reviewer. Review the PR diff below using the provided guidelines.
+
+          ## Core Guidelines
+          {core}
+
+          ## Tech-Specific Guidelines
+          {tech}
+
+          ## PR Diff
+          ```diff
+          {diff}
+          ```
+          {"⚠️ Note: This diff was truncated due to size. Review may be incomplete." if truncated else ""}
+
+          Respond in this format only:
+
+          ### 🔍 Issues
+          List issues as:
+          - **[CRITICAL | HIGH | MEDIUM | LOW]** Description. `file:line` → How to fix.
+          If none: write "No issues found."
+
+          ### 💡 Suggestions
+          - Up to 3 impactful improvements (skip if nothing meaningful to add)
+
+          ### ✅ Good Practices
+          - What was done well (up to 3 points)
+
+          ### 📋 Summary
+          One sentence overall assessment.
+          """
+
+          client  = anthropic.Anthropic(api_key=os.environ["CLAUDE_API_KEY"])
+          message = client.messages.create(
+              model="claude-sonnet-4-6",
+              max_tokens=1500,
+              messages=[{"role": "user", "content": prompt}]
+          )
+
+          review = message.content[0].text
+          with open("/tmp/review.txt", "w") as f:
+              f.write(review)
+
+          print("✅ Review complete.")
+          EOF
+
+      - name: Post review comment on PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs   = require("fs");
+            const path = "/tmp/review.txt";
+
+            if (!fs.existsSync(path)) {
+              console.log("No review output found. Skipping comment.");
+              return;
+            }
+
+            const review    = fs.readFileSync(path, "utf8").trim();
+            const truncated = "${{ steps.diff.outputs.truncated }}" === "true";
+
+            if (review === "NO_DIFF") {
+              console.log("Empty diff. No comment posted.");
+              return;
+            }
+
+            const body = [
+              "## 🤖 Automated Code Review",
+              "",
+              review,
+              "",
+              truncated ? "---\n⚠️ **Diff was truncated.** Large PRs may have incomplete reviews — consider splitting into smaller PRs." : "---",
+              "*Powered by Claude AI · [Guidelines](https://github.com/${{ env.GUIDELINES_REPO }})*"
+            ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+            console.log("✅ Review comment posted.");
