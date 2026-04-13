@@ -1,25 +1,27 @@
-# Core Code Review Guidelines
+# Core Review Guidelines
 
-## SOLID Principles
+## SOLID
+- Flag if: React component mixes fetch + state + logic + JSX, >150 lines → HIGH
+- Flag if: DRF view inlines ORM query + business logic + response shaping → HIGH
+- Flag if: if/elif chain >3 branches on type/status string → MEDIUM
+- Flag if: boto3/firebase client instantiated inside view, component, or task → MEDIUM
 
-- **Single Responsibility**: Each class/function should do ONE thing only. Flag functions that mix concerns (e.g., fetching data AND rendering).
-- **Open/Closed**: Logic should be extendable without modifying existing code. Flag direct modification of core logic instead of using abstraction.
-- **Liskov Substitution**: Subclasses must behave like their parent. Flag overrides that break expected behaviour.
-- **Interface Segregation**: Prefer small, focused interfaces. Flag components or classes that take on too many unrelated responsibilities.
-- **Dependency Inversion**: Depend on abstractions, not concrete implementations. Flag tight coupling between modules.
+## Clean Code
+- Flag if: function >50 lines or >4 params → MEDIUM
+- Flag if: nesting depth >3 → MEDIUM
+- Flag if: magic number/string in logic, not named constant → MEDIUM
+- Flag if: commented-out code, unused import/var, or code after return → MEDIUM
 
-## Uncle Bob's Clean Code
+## Security
+- Flag if: API key, JWT, password, AWS/Firebase secret, or DB URL hardcoded → CRITICAL
+- Flag if: token/PII written to localStorage, sessionStorage, or console.log → CRITICAL
+- Flag if: DRF view lacks permission_classes, uses AllowAny on write, or serializer fields='__all__' → CRITICAL
+- Flag if: .raw(), .extra(), or cursor.execute with f-string/%/concat of user input → CRITICAL
+- Flag if: dangerouslySetInnerHTML, eval, or new Function on non-constant input → CRITICAL
+- Flag if: CORS_ALLOW_ALL_ORIGINS=True, DEBUG=True, or ALLOWED_HOSTS=['*'] committed → CRITICAL
 
-- **Names**: Variables, functions and classes must reveal intent. Flag vague names like `data`, `temp`, `handleStuff`.
-- **Functions**: Keep functions small (ideally under 20 lines). Flag functions doing multiple distinct things.
-- **Comments**: Code should explain itself. Comments should explain WHY, not WHAT. Flag comments that restate the code.
-- **No Dead Code**: Flag unused variables, commented-out code blocks, and unreachable logic.
-- **Error Handling**: Errors must be handled explicitly. Flag empty catch blocks and silent failures.
-- **DRY**: Flag duplicated logic that should be extracted into a shared utility or function.
-
-## General
-
-- No hardcoded values — use constants or environment variables.
-- No `console.log` / `print` statements left in production code.
-- Security: Flag exposed secrets, unsanitised user input, or missing auth checks.
-- Performance: Flag obvious inefficiencies such as loops inside loops or repeated expensive operations.
+## Error Handling
+- Flag if: bare except or except Exception with pass/log-only/print → HIGH
+- Flag if: fetch/axios without .catch, try/catch, or response.ok check → HIGH
+- Flag if: await without try/catch and error not propagated → HIGH
+- Flag if: Celery task lacks retry or try/except around external I/O → MEDIUM

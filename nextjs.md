@@ -1,35 +1,27 @@
-# Next.js Code Review Guidelines
+# Next.js Review Guidelines
 
-## Components
+## Components & Rendering
+- Flag if: "use client" added to layout, page with only static content, or component using async/await at top → HIGH
+- Flag if: server component imports client-only API (window, document, localStorage, framer-motion) without "use client" → CRITICAL
+- Flag if: obj.a.b.c chained access without ?. or guard on fetched/props data → HIGH
+- Flag if: .map without stable key, or key={index} on reorderable list → MEDIUM
 
-- **Server vs Client**: Default to Server Components. Only use `"use client"` when you need interactivity (state, events, browser APIs). Flag unnecessary `"use client"` at the top of components.
-- **Single responsibility**: One component, one purpose. Flag components mixing data fetching, business logic, and UI.
-- **Props**: Flag components accepting excessive props (5+) — suggest breaking into smaller components or using composition.
+## State & Data Fetching
+- Flag if: fetch/axios in useEffect without cleanup, AbortController, or ignore flag → HIGH
+- Flag if: setState called in render body or after await without mounted check → HIGH
+- Flag if: Context value is inline object/array literal in Provider (value={{...}}) → MEDIUM
+- Flag if: useEffect dependency array missing referenced var, or [] with stale closure → HIGH
+- Flag if: response.json() called without checking response.ok first → HIGH
 
-## Data Fetching
-
-- Fetch data in Server Components where possible — not in `useEffect`.
-- Flag `useEffect` used purely for data fetching when a Server Component or React Query would be better.
-- Flag missing `loading` and `error` states on async data.
+## Auth (Firebase / Custom)
+- Flag if: protected route guarded only by client-side useEffect redirect → CRITICAL
+- Flag if: Firebase ID token stored in localStorage/cookie manually instead of getIdToken() per request → CRITICAL
+- Flag if: API call to Django backend without Authorization: Bearer header on authed route → CRITICAL
+- Flag if: onAuthStateChanged subscribed without unsubscribe in cleanup → MEDIUM
+- Flag if: Firebase config object with apiKey committed in non-NEXT_PUBLIC env or server file → HIGH
 
 ## Performance
-
-- Flag raw `<img>` tags — use `next/image` instead.
-- Flag large imports that could be lazy-loaded with `dynamic()`.
-- Flag missing `key` props on list items.
-
-## State Management
-
-- Flag business logic or API calls placed directly inside components — suggest moving to a custom hook or utility.
-- Flag prop drilling beyond 2-3 levels — suggest Context or a state library.
-
-## Security
-
-- Flag environment variables prefixed with `NEXT_PUBLIC_` that contain sensitive values (keys, secrets).
-- Flag user input used directly in rendering without sanitisation.
-
-## API Routes
-
-- Flag API routes with no input validation.
-- Flag API routes missing authentication/authorisation checks.
-- Flag sensitive data returned in responses unnecessarily.
+- Flag if: motion component animates layout properties (width, height, top, left) instead of transform/opacity → MEDIUM
+- Flag if: <img> used instead of next/image for static/remote images → MEDIUM
+- Flag if: large list rendered without virtualization or pagination (>100 items mapped) → MEDIUM
+- Flag if: AnimatePresence wraps list without unique key per child → HIGH
