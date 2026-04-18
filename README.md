@@ -299,3 +299,9 @@ A: Update the `core_guidelines` variable in one workflow, then manually update a
 2. Review Claude API status: https://status.anthropic.com
 3. Check API key validity: https://console.anthropic.com
 
+
+✅ IDEAL      ██░░░░░░░░   +200 -80    Full review, no truncation
+✅ OK         ████░░░░░░   +400 -150   Covered comfortably  
+⚠️ LARGE      ███████░░░   +700 -250   Borderline, review may miss things
+❌ TOO BIG    ██████████   +1000 -300  Split this PR
+
