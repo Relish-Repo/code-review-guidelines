@@ -2,21 +2,24 @@ name: Automated Code Review
 
 on:
   pull_request:
-    branches:
-      - main
-      - dev
+    branches: [main, dev]
     types: [opened, synchronize, reopened]
+    paths:
+      - '**.js'
+      - '**.jsx'
+      - '**.css'
+      - '**.scss'
 
 permissions:
   pull-requests: write
   contents: read
 
-# ─── ONLY THIS CHANGES between Next.js and Django repos ───
+# ─── ONLY THIS SECTION CHANGES BETWEEN NEXTJS AND DJANGO ───
 env:
   TECH_FILE: nextjs.md
   GUIDELINES_REPO: Relish-Repo/code-review-guidelines
   GUIDELINES_BRANCH: main
-# ──────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────
 
 jobs:
   code-review:
@@ -29,132 +32,215 @@ jobs:
         with:
           fetch-depth: 0
 
+      # ── Step 1: Collect PR metadata ──────────────────────────────
+      - name: Collect PR metadata
+        id: metadata
+        run: |
+          git log origin/${{ github.base_ref }}...HEAD \
+            --pretty=format:"- %s" > /tmp/commits.txt
+          echo "✅ Commits collected."
+
+      # ── Step 2: Get filtered diff ─────────────────────────────────
       - name: Get PR diff
         id: diff
         run: |
-          git fetch origin ${{ github.base_ref }} --depth=1
-          git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr.diff
+          git diff origin/${{ github.base_ref }}...HEAD \
+            -- ':!*.lock'            \
+            ':!package-lock.json'    \
+            ':!yarn.lock'            \
+            ':!public/**'            \
+            ':!*.min.js'             \
+            ':!*.min.css'            \
+            ':!dist/**'              \
+            ':!build/**'             \
+            ':!.next/**'             \
+            ':!*.config.js' > /tmp/pr.diff
+
+          # Strip git header noise — keep only actual code changes
+          grep -vE '^(diff --git|index |old mode|new mode|Binary|similarity|rename|copy)' \
+            /tmp/pr.diff > /tmp/pr_clean.diff || true
+          mv /tmp/pr_clean.diff /tmp/pr.diff
 
           SIZE=$(wc -c < /tmp/pr.diff)
           echo "size=$SIZE" >> $GITHUB_OUTPUT
 
-          # Truncate if too large (>40,000 chars)
-          if [ "$SIZE" -gt 40000 ]; then
-            head -c 40000 /tmp/pr.diff > /tmp/pr_trimmed.diff
-            mv /tmp/pr_trimmed.diff /tmp/pr.diff
-            echo "truncated=true" >> $GITHUB_OUTPUT
-            echo "⚠️ Diff was large and has been truncated."
-          else
+          if [ "$SIZE" -eq 0 ]; then
+            echo "empty=true"     >> $GITHUB_OUTPUT
             echo "truncated=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No reviewable changes after filtering. Skipping."
+          elif [ "$SIZE" -gt 150000 ]; then
+            head -c 150000 /tmp/pr.diff > /tmp/pr_trim.diff
+            mv /tmp/pr_trim.diff /tmp/pr.diff
+            echo "empty=false"    >> $GITHUB_OUTPUT
+            echo "truncated=true" >> $GITHUB_OUTPUT
+            echo "⚠️ Diff truncated at 150K chars."
+          else
+            echo "empty=false"     >> $GITHUB_OUTPUT
+            echo "truncated=false" >> $GITHUB_OUTPUT
+            echo "✅ Diff size: ${SIZE} chars."
           fi
 
-      - name: Fetch guidelines from private repo
-        env:
-          GUIDELINES_TOKEN: ${{ secrets.GUIDELINES_TOKEN }}
+      # ── Step 3: Fetch guidelines from central repo ────────────────
+      - name: Fetch guidelines
+        if: steps.diff.outputs.empty == 'false'
         run: |
           BASE="https://raw.githubusercontent.com/${{ env.GUIDELINES_REPO }}/${{ env.GUIDELINES_BRANCH }}"
-          AUTH="Authorization: token $GUIDELINES_TOKEN"
 
-          curl -sSf -H "$AUTH" "$BASE/core.md" -o /tmp/core.md
-          curl -sSf -H "$AUTH" "$BASE/${{ env.TECH_FILE }}" -o /tmp/tech.md
+          curl -sSf "$BASE/core.md" -o /tmp/core.md \
+            || { echo "❌ Failed to fetch core.md"; exit 1; }
 
-          echo "✅ Guidelines fetched successfully."
+          curl -sSf "$BASE/${{ env.TECH_FILE }}" -o /tmp/tech.md \
+            || { echo "❌ Failed to fetch ${{ env.TECH_FILE }}"; exit 1; }
 
+          echo "✅ Guidelines fetched."
+
+      # ── Step 4: Install SDK ───────────────────────────────────────
       - name: Install Anthropic SDK
-        run: pip install anthropic --quiet
+        if: steps.diff.outputs.empty == 'false'
+        run: pip install anthropic --quiet --break-system-packages
 
-      - name: Run Claude code review
-        id: review
-        env:
-          CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
-          TRUNCATED: ${{ steps.diff.outputs.truncated }} 
+      # ── Step 5: Write review script ───────────────────────────────
+      - name: Write review script
+        if: steps.diff.outputs.empty == 'false'
         run: |
-          python3 - <<'EOF'
-          import anthropic, os, sys
+          cat > /tmp/review.py << 'PYTHON'
+          import anthropic
+          import os
+          import sys
 
-          core       = open("/tmp/core.md").read()
-          tech       = open("/tmp/tech.md").read()
-          diff       = open("/tmp/pr.diff").read()
-          truncated  = os.environ.get("TRUNCATED", "false") == "true"
+          # Load files
+          core    = open("/tmp/core.md").read().strip()
+          tech    = open("/tmp/tech.md").read().strip()
+          diff    = open("/tmp/pr.diff").read().strip()
+          commits = open("/tmp/commits.txt").read().strip() \
+                    if os.path.exists("/tmp/commits.txt") else ""
 
-          if not diff.strip():
-              print("NO_DIFF")
+          truncated = os.environ.get("TRUNCATED", "false") == "true"
+          pr_title  = os.environ.get("PR_TITLE", "").strip()
+          pr_body   = os.environ.get("PR_BODY", "").strip()[:500]
+
+          if not diff:
+              with open("/tmp/review.txt", "w") as f:
+                  f.write("NO_DIFF")
               sys.exit(0)
 
-          prompt = f"""You are an expert code reviewer. Review the PR diff below using the provided guidelines.
+          # Build PR context block
+          context_parts = []
+          if pr_title:
+              context_parts.append(f"PR Title: {pr_title}")
+          if pr_body:
+              context_parts.append(f"PR Description: {pr_body}")
+          if commits:
+              context_parts.append(f"Commits in this PR:\n{commits}")
+          if truncated:
+              context_parts.append(
+                  "⚠️ This diff was truncated at 150,000 chars. "
+                  "Review is based on partial changes — flag this in your summary."
+              )
+          context = "\n\n".join(context_parts)
 
-          ## Core Guidelines
-          {core}
+          # System prompt: role + guidelines + output format
+          system_prompt = f"""You are a senior code reviewer. \
+Find real bugs, security issues, and reliability problems only. \
+Do not comment on formatting or style — linters handle that.
 
-          ## Tech-Specific Guidelines
-          {tech}
+## Core Guidelines
+{core}
 
-          ## PR Diff
-          ```diff
-          {diff}
-          ```
-          {"⚠️ Note: This diff was truncated due to size. Review may be incomplete." if truncated else ""}
+## Tech-Specific Guidelines
+{tech}
 
-          Respond in this format only:
+## Response Format — follow exactly, no deviations:
 
-          ### 🔍 Issues
-          List issues as:
-          - **[CRITICAL | HIGH | MEDIUM | LOW]** Description. `file:line` → How to fix.
-          If none: write "No issues found."
+### 🔍 Issues
+- **[CRITICAL|HIGH|MEDIUM|LOW]** Description. `file:line` → How to fix.
+If no issues found write: "No issues found."
 
-          ### 💡 Suggestions
-          - Up to 3 impactful improvements (skip if nothing meaningful to add)
+### 💡 Suggestions
+Up to 2 impactful improvements only. Skip this section entirely if nothing meaningful to add.
 
-          ### ✅ Good Practices
-          - What was done well (up to 3 points)
+### 📋 Summary
+One sentence. Maximum 15 words."""
 
-          ### 📋 Summary
-          One sentence overall assessment.
-          """
+          # User message: context + diff
+          user_message = f"""{context}
 
-          client  = anthropic.Anthropic(api_key=os.environ["CLAUDE_API_KEY"])
-          message = client.messages.create(
-              model="claude-haiku-4-5-20251001",
-              max_tokens=1500,
-              messages=[{"role": "user", "content": prompt}]
-          )
+PR Diff:
+```diff
+{diff}
+```"""
 
-          review = message.content[0].text
+          # Call Claude API
+          client = anthropic.Anthropic(api_key=os.environ["CLAUDE_API_KEY"])
+
+          try:
+              response = client.messages.create(
+                  model="claude-haiku-4-5-20251001",
+                  max_tokens=2000,
+                  temperature=0,
+                  system=system_prompt,
+                  messages=[{"role": "user", "content": user_message}]
+              )
+              review = response.content[0].text
+
+          except anthropic.RateLimitError:
+              review = "⚠️ Review skipped: Claude API rate limit reached. Try again shortly."
+          except anthropic.AuthenticationError:
+              review = "⚠️ Review skipped: Invalid CLAUDE_API_KEY. Check your repository secret."
+          except Exception as e:
+              review = f"⚠️ Review failed unexpectedly: {str(e)}"
+
           with open("/tmp/review.txt", "w") as f:
               f.write(review)
 
-          print("✅ Review complete.")
-          EOF
+          print("✅ Review written.")
+          PYTHON
 
-      - name: Post review comment on PR
+      # ── Step 6: Run the review ────────────────────────────────────
+      - name: Run review script
+        if: steps.diff.outputs.empty == 'false'
+        env:
+          CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+          TRUNCATED:      ${{ steps.diff.outputs.truncated }}
+          PR_TITLE:       ${{ github.event.pull_request.title }}
+          PR_BODY:        ${{ github.event.pull_request.body }}
+        run: python3 /tmp/review.py
+
+      # ── Step 7: Post comment on PR ────────────────────────────────
+      - name: Post comment on PR
+        if: always() && steps.diff.outputs.empty == 'false'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const fs   = require("fs");
-            const path = "/tmp/review.txt";
+            const fs = require("fs");
 
-            if (!fs.existsSync(path)) {
-              console.log("No review output found. Skipping comment.");
+            if (!fs.existsSync("/tmp/review.txt")) {
+              console.log("No review file found. Skipping.");
               return;
             }
 
-            const review    = fs.readFileSync(path, "utf8").trim();
+            const review    = fs.readFileSync("/tmp/review.txt", "utf8").trim();
             const truncated = "${{ steps.diff.outputs.truncated }}" === "true";
 
-            if (review === "NO_DIFF") {
-              console.log("Empty diff. No comment posted.");
+            if (!review || review === "NO_DIFF") {
+              console.log("Empty diff or no review output. Skipping comment.");
               return;
             }
+
+            const truncatedNote = truncated
+              ? "\n⚠️ **Diff truncated at 150K chars.** Split large PRs for a complete review."
+              : "";
 
             const body = [
               "## 🤖 Automated Code Review",
               "",
               review,
               "",
-              truncated ? "---\n⚠️ **Diff was truncated.** Large PRs may have incomplete reviews — consider splitting into smaller PRs." : "---",
-              "*Powered by Claude AI · [Guidelines](https://github.com/${{ env.GUIDELINES_REPO }})*"
-            ].join("\n");
+              "---",
+              truncatedNote,
+              `*Powered by Claude AI · [Guidelines](https://github.com/${{ env.GUIDELINES_REPO }})*`
+            ].filter(line => line !== undefined).join("\n");
 
             await github.rest.issues.createComment({
               owner:        context.repo.owner,
